@@ -5,6 +5,7 @@ import atexit
 import hashlib
 import ipaddress
 import json
+import logging
 import operator
 import os
 import pprint
@@ -20,7 +21,19 @@ import sys
 import time
 import urllib3
 import yaml
-from pyVim.task import WaitForTask
+from pyVim.task import WaitForTask, WaitForTasks
+
+## logging
+
+logging.basicConfig(format='%(relativeCreated)6d %(levelname)s %(message)s',
+                    level=logging.DEBUG)
+log = logging.getLogger()
+log.task = log.info
+
+
+def quit(msg):
+    log.error(msg)
+    sys.exit(1)
 
 
 def parse_args():
@@ -107,6 +120,9 @@ def parse_args():
     # Status
     parser.add_argument("--show-all", required=False, action="store_true",
                         help="Show every VMs on the cluster, can take long time")
+    parser.add_argument(
+        "--show-regex", required=False,
+        help="Show VMs on the cluster matching a regex")
 
     args = parser.parse_args()
     return(args)
@@ -119,9 +135,9 @@ def load_yaml(yaml_file):
             content = yaml.load(f)
         return(content)
     except IOError as e:
-        Log.error("I/O error: {0}".format(e))
+        quit("I/O error: {0}".format(e))
     except yaml.YAMLError as ey:
-        Log.error("Error in yaml file: {0}".format(ey))
+        quit("Error in yaml file: {0}".format(ey))
 
 
 def get_user_opt(args):
@@ -179,8 +195,9 @@ def generate_config(user_opt):
 
     # The API needs a / to know it is a directory
     media_dir = config["parameters"]["media_dir"]
-    if media_dir[-1] is not "/":
-        config["parameters"]["media_dir"] = "{0}/".format(media_dir)
+    if media_dir:
+        if media_dir[-1] is not "/":
+            config["parameters"]["media_dir"] = "{0}/".format(media_dir)
 
     # Create media path
     config["parameters"]["media"] = "{0}{1}".format(config["parameters"]["media_dir"],
@@ -238,28 +255,6 @@ def generate_config(user_opt):
     return config
 
 
-class Log(object):
-    @staticmethod
-    def subtask(message):
-        print("INFO: {0}".format(message))
-
-    @staticmethod
-    def task(message):
-        print("TASK: {0}".format(message))
-
-    @staticmethod
-    def info(message):
-        print("INFO: {0}".format(message))
-
-    @staticmethod
-    def warning(message):
-        print("WARNING: {0}".format(message))
-
-    @staticmethod
-    def error(message):
-        sys.exit("ERROR: {0}".format(message))
-
-
 def get_obj(service_instance, viewType, obj_name, content=None):
     """ Return an object from ServiceInstance """
     recursive = True
@@ -300,8 +295,8 @@ class VSphere(object):
 
     # Connect to vCenter
     def connect(self):
-        Log.task("log in to vcenter".format(self.host))
-        Log.info("connecting...")
+        log.task("log in to vcenter".format(self.host))
+        log.info("connecting...")
         try:
             if self.insecure is False:
                 service_instance = connect.SmartConnect(
@@ -312,7 +307,7 @@ class VSphere(object):
                 )
                 atexit.register(connect.Disconnect, service_instance)
                 self.service_instance = service_instance
-                Log.info("connection succeeded".format(self.host))
+                log.info("connection succeeded".format(self.host))
                 return service_instance
             elif self.insecure is True:
                 service_instance = connect.SmartConnectNoSSL(
@@ -323,10 +318,10 @@ class VSphere(object):
                 )
                 atexit.register(connect.Disconnect, service_instance)
                 self.service_instance = service_instance
-                Log.info("connection succeeded".format(self.host))
+                log.info("connection succeeded".format(self.host))
                 return service_instance
         except Exception as e:
-            Log.error("connection failed: {0}".format(e))
+            quit("connection failed: {0}".format(e))
 
     def _content(self):
         return self.service_instance.RetrieveContent()
@@ -338,7 +333,7 @@ class VSphere(object):
                              vim.Datacenter], self.datacenter_name, self.content)
 
         if not datacenter:
-            Log.error("datacenter not found: {0}".format(
+            quit("datacenter not found: {0}".format(
                 self.datacenter_name))
 
         return datacenter
@@ -352,7 +347,7 @@ class VSphere(object):
                 break
 
         if not datastore:
-            Log.error("datastore not found: {0}".format(
+            quit("datastore not found: {0}".format(
                 self.datastore_name))
 
         return datastore
@@ -364,7 +359,7 @@ class VSphere(object):
                           vim.Network], self.network_name, self.content)
 
         if not network:
-            Log.error("network not found: {0}".format(self.network_name))
+            quit("network not found: {0}".format(self.network_name))
         return network
 
     def get_resource_pool(self):
@@ -374,7 +369,7 @@ class VSphere(object):
                                 vim.ResourcePool], self.resource_pool_name, self.content)
 
         if not resource_pool:
-            Log.error("resource pool not found: {0}".format(
+            quit("resource pool not found: {0}".format(
                 self.resource_pool_name))
 
         return resource_pool
@@ -404,18 +399,18 @@ class CloudInit(object):
         instance_id = role_config["instance_id"]
         cloud_init_file = role_config["cloud_init_file"]
 
-        Log.task("create cloud-init iso: {0}".format(instance_id))
+        log.task("create cloud-init iso: {0}".format(instance_id))
         if not os.path.exists(iso_path):
             if not os.path.exists(path):
                 os.makedirs(path)
 
             try:
-                Log.info("generating metada-data")
+                log.info("generating metada-data")
                 with open("{0}/meta-data".format(path), "w", encoding="utf-8") as f:
                     f.write(
                         "instance-id: {0}\nlocal-hostname: caasp".format(instance_id))
 
-                Log.info("generating user-data")
+                log.info("generating user-data")
                 with open(cloud_init_file, "r", encoding="utf-8") as f:
                     if admin_ip:
                         user_data = f.read().replace("SET_ADMIN_NODE", admin_ip)
@@ -425,24 +420,24 @@ class CloudInit(object):
                 with open("{0}/user-data".format(path), "w", encoding="utf-8") as f:
                     f.write(user_data)
 
-                Log.info("creating iso")
+                log.info("creating iso")
                 subprocess.run("genisoimage -output {0} -volid cidata -joliet -rock user-data meta-data >/dev/null 2>&1".format(
                     iso_filename), cwd=path, shell=True, check=True)
-                Log.info("iso successfully created")
+                log.info("iso successfully created")
             except IOError as e:
-                Log.error("i/o error: {0}".format(e))
+                quit("i/o error: {0}".format(e))
             except subprocess.SubprocessError as es:
-                Log.error(
+                quit(
                     "shelling out to genisoimage failed: {0}".format(es))
         else:
-            Log.info("iso already created")
+            log.info("iso already created")
 
     @staticmethod
     def push_iso(vsphere, role_config):
         iso_path = "{0}/{1}".format(role_config["path"],
                                     role_config["iso_filename"])
 
-        Log.task("push cloud-init iso to the datastore")
+        log.task("push cloud-init iso to the datastore")
         Datastore.upload_file(
             vsphere, iso_path, role_config["ds_cloud_iso_path"])
 
@@ -466,7 +461,7 @@ class HttpRequest(object):
                                      verify=self.verify)
             return request.status_code
         except (ConnectionError, requests.HTTPError, requests.Timeout) as e:
-            Log.error("connection failed: {0}".format(e))
+            quit("connection failed: {0}".format(e))
 
     def get(self, **kwargs):
         try:
@@ -476,7 +471,7 @@ class HttpRequest(object):
             request.raise_for_status()
             return request
         except (ConnectionError, requests.HTTPError, requests.Timeout) as e:
-            Log.error("connection failed: {0}".format(e))
+            quit("connection failed: {0}".format(e))
 
     def put(self, **kwargs):
         try:
@@ -486,7 +481,7 @@ class HttpRequest(object):
             request.raise_for_status()
             return request
         except (ConnectionError, requests.HTTPError, requests.Timeout) as e:
-            Log.error("connection failed: {0}".format(e))
+            quit("connection failed: {0}".format(e))
 
     def close(self):
         self.http.close()
@@ -519,11 +514,11 @@ class Datastore(object):
 
         remote_file_exists = remote_file_req.head()
 
-        Log.info("- source: {0}".format(src_file))
-        Log.info("- destination: [{0}]{1}".format(vsphere.datastore.info.name,
+        log.info("- source: {0}".format(src_file))
+        log.info("- destination: [{0}]{1}".format(vsphere.datastore.info.name,
                                                   remote_file))
         if remote_file_exists == 404:
-            Log.info("uploading...")
+            log.info("uploading...")
             if src_file[:4] == "http":
                 file_url = HttpRequest(http_url=src_file)
                 f = file_url.get(stream=True)
@@ -532,10 +527,10 @@ class Datastore(object):
                 with open(src_file, "rb") as f:
                     remote_file_req.put(data=f)
 
-            Log.info("file upload succeeded")
+            log.info("file upload succeeded")
             remote_file_req.close()
         else:
-            Log.info("file already exists on the datastore")
+            log.info("file already exists on the datastore")
 
     @staticmethod
     def path_exists(vsphere, path):
@@ -573,7 +568,7 @@ class Datastore(object):
         except vim.fault.FileNotFound as e:
             path_exist = False
         except vim.fault.InvalidDatastore as e:
-            Log.error(
+            quit(
                 "operation cannot be performed on the target datastore: {0}".format(e))
         finally:
             return path_exist
@@ -596,7 +591,7 @@ class Datastore(object):
             for f in result.file:
                 files.append(f.path)
         except vim.fault.FileNotFound:
-            Log.error("path does not exist: {0}".format(datastore_path))
+            quit("path does not exist: {0}".format(datastore_path))
 
         return files
 
@@ -608,15 +603,14 @@ class Datastore(object):
         datastore = "[{0}]".format(vsphere.datastore.name)
         datastore_path = datastore + path
 
-        Log.task("create directory: {0}".format(datastore_path))
+        log.task("create directory: {0}".format(datastore_path))
         try:
-            Log.info("creating...")
             vsphere.file_manager.MakeDirectory(
                 datacenter=vsphere.datacenter,
                 name=datastore_path)
-            Log.info("creation succeeded")
+            log.info("creation succeeded")
         except vim.fault.FileAlreadyExists:
-            Log.info("directory already exists, nothing to do")
+            log.info("directory already exists, nothing to do")
 
     @staticmethod
     def delete_path(vsphere, path):
@@ -630,17 +624,17 @@ class Datastore(object):
             datacenter=vsphere.datacenter,
             name=datastore_path)
 
-        Log.task("delete path: {0}".format(datastore_path))
+        log.task("delete path: {0}".format(datastore_path))
         try:
-            Log.info("deleting...")
+            log.info("deleting...")
             WaitForTask(task)
-            Log.info("deletion succeeded")
+            log.info("deletion succeeded")
         except vim.fault.FileNotFound:
-            Log.info("path not found, nothing to do")
+            log.info("path not found, nothing to do")
         except vim.fault.CannotDeleteFile as e:
-            Log.error("file deletion failed: {0}".format(e))
+            quit("file deletion failed: {0}".format(e))
         except vim.fault.FileLocked:
-            Log.error("file is locked or in use")
+            quit("file is locked or in use")
 
 
 class VMachine(object):
@@ -692,16 +686,9 @@ class VMachine(object):
 
     def get_vm(self, isTemplate=False):
         """ Return VirtualMachine object from a Datacenter """
-        vm = None
-
-        if isTemplate:
-            vm_name = self.template_name
-        else:
-            vm_name = self.name
-
-        for vm in self.datacenter.vmFolder.childEntity:
-            if vm.name == vm_name:
-                return vm
+        vm_name = self.template_name if isTemplate else self.name
+        return self.service_instance.content.searchIndex.FindChild(
+            self.datacenter.vmFolder, vm_name)
 
     def _check_media(self):
         """ Check if the media exists on a datastore """
@@ -709,7 +696,7 @@ class VMachine(object):
         if media_exists:
             return media_exists
         else:
-            Log.error("media file not found: {0}".format(
+            quit("media file not found: {0}".format(
                 self.media_name))
 
     def _copy_vmdk(self):
@@ -720,15 +707,15 @@ class VMachine(object):
                                                              sourceDatacenter=self.datacenter,
                                                              destDatacenter=self.datacenter,
                                                              destName=dest_path)
-            Log.subtask("copy vmdk")
-            Log.info("- source:".format(self.media_path))
-            Log.info("- destination:".format(self.dest_path))
+            log.subtask("copy vmdk")
+            log.info("- source:".format(self.media_path))
+            log.info("- destination:".format(self.dest_path))
             try:
-                Log.info("copying...")
+                log.info("copying...")
                 WaitForTask(task, self.service_instance)
-                Log.info("copy succeded")
+                log.info("copy succeded")
             except Exception as e:
-                Log.error("copy error: {0}".format(e))
+                quit("copy error: {0}".format(e))
 
     def get_ip(self):
         """ Get first IPv4 available on the first NIC """
@@ -744,7 +731,7 @@ class VMachine(object):
         else:
             return ip
 
-    def create_vm(self, isTemplate=False):
+    def create_vm_async(self, isTemplate=False):
         """
         Create a VM, name is set to template_name
         if isTemplate is set to True
@@ -761,10 +748,10 @@ class VMachine(object):
             vm_path_name = self.vm_path
             vdisk_file_name = "{0}/{1}.vmdk".format(self.vm_path, vm_name)
 
-        Log.subtask("create virtual machine: {0}".format(vm_name))
+        log.subtask("create virtual machine: {0}".format(vm_name))
 
         if self.vm_obj:
-            Log.error("virtual machine not found")
+            quit("virtual machine not found")
         else:
             vmx_file = vim.vm.FileInfo(logDirectory=None,
                                        snapshotDirectory=None,
@@ -826,13 +813,17 @@ class VMachine(object):
 
             task = self.datacenter.vmFolder.CreateVM_Task(
                 config=vm_spec, pool=self.resource_pool)
-            try:
-                Log.info("creating...".format(vm_name))
-                WaitForTask(task, self.service_instance)
-                Log.info("creation succeeded".format(vm_name))
-                self.vm_obj = self.get_vm(isTemplate)
-            except Exception as e:
-                Log.error("creation error: {0}".format(e))
+            log.info("creating {}".format(vm_name))
+            return task
+
+    def create_vm(self, isTemplate=False):
+        try:
+            task = self.create_vm_async(isTemplate=isTemplate)
+            WaitForTask(task, self.service_instance)
+            log.info("creation succeeded")
+            self.vm_obj = self.get_vm(isTemplate)
+        except Exception as e:
+            quit("creation error: {0}".format(e))
 
     def create_vm_template(self, isTemplate=True):
         """ Wrapper to create a VM and mark it as a Template """
@@ -840,24 +831,24 @@ class VMachine(object):
 
         if not self.vm_obj:
             self.create_vm(isTemplate)
-            Log.info("marking as template...")
+            log.info("marking as template...")
             self.vm_obj.MarkAsTemplate()
-            Log.info("marking succeeded")
+            log.info("marking succeeded")
 
     def delete(self):
         """ Delete a VM """
-        Log.subtask("delete virtual machine: {0}".format(self.name))
+        log.subtask("delete virtual machine: {0}".format(self.name))
         if self.vm_obj:
             try:
-                Log.info("deleting...")
+                log.info("deleting...")
                 task = self.vm_obj.Destroy_Task()
                 WaitForTask(task, self.service_instance)
                 self.vm_obj = self.get_vm()
-                Log.info("deletion succeded")
+                log.info("deletion succeded")
             except Exception as e:
-                Log.error("deletion failed: ".format(e))
+                quit("deletion failed: ".format(e))
         else:
-            Log.info("virtual machine not found")
+            log.info("virtual machine not found")
 
     def unregister(self, isTemplate=False):
         """ Unregister a VM or a VM Template """
@@ -867,66 +858,66 @@ class VMachine(object):
         else:
             vm_name = self.name
 
-        Log.subtask("unregister virtual machine: {0}".format(vm_name))
+        log.subtask("unregister virtual machine: {0}".format(vm_name))
         if self.vm_obj:
             try:
-                Log.info("unregistering...")
+                log.info("unregistering...")
                 self.vm_obj.UnregisterVM()
                 self.vm_obj = self.get_vm(isTemplate)
-                Log.info("unregistration succeded")
+                log.info("unregistration succeded")
             except Exception as e:
-                Log.error("unregistration failed: {0}".format(e))
+                quit("unregistration failed: {0}".format(e))
         else:
-            Log.info("virtual machine not found")
+            log.info("virtual machine not found")
 
     def power_on(self):
         """ Power-on a VM """
-        Log.subtask("power-on virtual machine: {0}".format(self.name))
+        log.subtask("power-on virtual machine: {0}".format(self.name))
 
         if not self.vm_obj.runtime.powerState == "poweredOn":
             try:
-                Log.info("powering-on...")
+                log.info("powering-on...")
                 task = self.vm_obj.PowerOnVM_Task()
                 WaitForTask(task, self.service_instance)
                 self.vm_obj = self.get_vm()
-                Log.info("powering-on succeded")
+                log.info("powering-on succeded")
             except Exception as e:
-                Log.error("powering-on failed: {0}".format(e))
+                quit("powering-on failed: {0}".format(e))
         else:
-            Log.info("virtual machine already powered-on")
+            log.info("virtual machine already powered-on")
 
     def power_off(self):
         """ Power-off a VM """
-        Log.subtask("power-off virtual machine: {0}".format(self.name))
+        log.subtask("power-off virtual machine: {0}".format(self.name))
 
         self.vm_obj = self.get_vm()
         if self.vm_obj:
             if self.vm_obj.runtime.powerState == "poweredOn":
                 try:
-                    Log.info("powering-off...")
+                    log.info("powering-off...")
                     task = self.vm_obj.PowerOffVM_Task()
                     WaitForTask(task, self.service_instance)
                     self.vm_obj = self.get_vm()
-                    Log.info("powering-off succeded")
+                    log.info("powering-off succeded")
                 except Exception as e:
-                    Log.error("powering-off failed: {0}".format(e))
+                    quit("powering-off failed: {0}".format(e))
             else:
-                Log.info("virtual machine in not powered-on")
+                log.info("virtual machine in not powered-on")
 
     def destroy(self):
         """ Wrapper to destroy a VM """
-        Log.task("destroy virtual machine: {0}".format(self.name))
-        Log.info("destroying...")
+        log.task("destroy virtual machine: {0}".format(self.name))
+        log.info("destroying...")
         self.power_off()
         self.delete()
-        Log.info("destroy succeeded")
+        log.info("destroy succeeded")
 
     def clone_vm(self):
         """ Clone VM from a previously created template,
         template_name == vm_name without last 3 digits """
-        Log.subtask("clone virtual machine")
-        Log.info("- source: {0}".format(self.template_name))
-        Log.info("- destination: {0}".format(self.name))
+        log.subtask("clone virtual machine")
+        log.info("- source: {0}".format(self.template_name))
+        log.info("- destination: {0}".format(self.name))
 
         template_vm = self.get_vm(isTemplate=True)
         if template_vm:
@@ -945,20 +936,49 @@ class VMachine(object):
                 spec=vm_clone_spec)
 
             try:
-                Log.info("cloning...")
+                log.info("cloning...")
                 WaitForTask(task)
                 self.vm_obj = self.get_vm(isTemplate=False)
-                Log.info("cloning succeeded")
+                log.info("cloning succeeded")
             except Exception as e:
-                Log.error("cloning failed: {0}".format(e))
+                quit("cloning failed: {0}".format(e))
         else:
-            Log.error("template not found: {0}".format(self.template_name))
+            quit("template not found: {0}".format(self.template_name))
+
+    def async_clone_vm(self):
+        """ Clone VM from a previously created template,
+        template_name == vm_name without last 3 digits """
+        log.subtask("clone virtual machine")
+        log.info("- source: {0}".format(self.template_name))
+        log.info("- destination: {0}".format(self.name))
+
+        template_vm = self.get_vm(isTemplate=True)
+        if not template_vm:
+            raise Exception("template not found: {0}".format(
+                self.template_name))
+
+        self._check_media()
+
+        vm_clone_spec = vim.vm.CloneSpec(
+            location=vim.vm.RelocateSpec(
+                datastore=self.datastore,
+                pool=self.resource_pool),
+            powerOn=False,
+            template=False)
+
+        log.info("cloning...")
+        task = template_vm.CloneVM_Task(
+            folder=self.datacenter.vmFolder,
+            name=self.name,
+            spec=vm_clone_spec)
+
+        return task
 
     def deploy(self, admin_ip=None):
         """ Wrapper to deploy a VM (slow) """
 
-        Log.task("deploy virtual machine: {0}".format(self.name))
-        Log.info("deploying...")
+        log.task("deploy virtual machine: {0}".format(self.name))
+        log.info("deploying...")
 
         self.create_vm()
         self._copy_vmdk()
@@ -966,13 +986,13 @@ class VMachine(object):
         CloudInit.push_iso(self.vsphere, self.role_config)
         self.power_on()
 
-        Log.info("deployment succeeded")
+        log.info("deployment succeeded")
 
     def deploy_from_template(self, create_template=False, admin_ip=None):
         """ Wrapper to deploy a VM from a previously created template (fast) """
 
-        Log.task("deploy virtual machine from template: {0}".format(self.name))
-        Log.info("deploying...")
+        log.task("deploy virtual machine from template: {0}".format(self.name))
+        log.info("deploying...")
 
         if create_template:
             self.create_vm_template()
@@ -982,7 +1002,7 @@ class VMachine(object):
         CloudInit.push_iso(self.vsphere, self.role_config)
         self.power_on()
 
-        Log.info("deployment succeeded")
+        log.info("deployment succeeded")
 
 
 def clean_up(location, path, vsphere=None):
@@ -991,7 +1011,7 @@ def clean_up(location, path, vsphere=None):
     or remote directory in deployment dir path
     """
 
-    Log.task("clean-up {0} files".format(location))
+    log.task("clean-up {0} files".format(location))
 
     if location == "local":
         p = os.path.dirname(path)
@@ -1001,7 +1021,15 @@ def clean_up(location, path, vsphere=None):
     if location == "remote":
         Datastore.delete_path(vsphere, path)
 
-    Log.info("cleaning-up succeeded")
+    log.info("cleaning-up succeeded")
+
+
+def wait(tasks):
+    tasks = list(tasks)
+    if tasks:
+        log.info("waiting on %d tasks..." % len(tasks))
+        WaitForTasks(tasks, wait._service_instance)
+    log.info("done")
 
 
 def deploy(vsphere, conf):
@@ -1013,16 +1041,29 @@ def deploy(vsphere, conf):
     # Clean up local deployment files if previous deployment failed
     clean_up(location="local", path=conf["admin"]["config"]["path"])
 
-    Log.task("create virtual machines role templates")
+    log.task("create virtual machines role templates")
+    templates = []
     for r in ["admin", "master", "worker"]:
         for vm_config in conf[r]["vmguests"]:
             vm = VMachine(vsphere, conf["parameters"],
                           conf[r]["config"], vm_config)
-            vm.create_vm_template()
+            assert not vm.get_vm(True)
+            templates.append(vm)
             break
 
+    wait(vm.create_vm_async(True) for vm in templates)
+    for vm in templates:
+        vm.vm_obj = vm.get_vm(True)
+        if vm.vm_obj:
+            log.info("Already created")
+            continue
+
+        vm.vm_obj = vm.get_vm(True)
+        vm.vm_obj.MarkAsTemplate()
+        log.info("marking succeeded")
+
     # Deploy Admin node
-    Log.task("deploy admin nodes")
+    log.task("deploy admin nodes")
     for vm_config in conf["admin"]["vmguests"]:
         vm = VMachine(vsphere, conf["parameters"],
                       conf["admin"]["config"], vm_config)
@@ -1030,15 +1071,24 @@ def deploy(vsphere, conf):
 
         # Retrieve Admin IP address
         admin_ip = get_vm_ip(vm, timeout=240, sleep=20)
-        Log.info("Admin node IP address: {0}".format(admin_ip))
+        log.info("Admin node IP address: {0}".format(admin_ip))
 
-    # Deploy Master and Worker nodes
+    # Deploy Master and Worker nodes in parallel
+    vms = []
     for r in ["master", "worker"]:
-        Log.task("deploy {0} nodes".format(r))
+        log.task("deploy {0} nodes".format(r))
         for vm_config in conf[r]["vmguests"]:
             vm = VMachine(vsphere, conf["parameters"],
                           conf[r]["config"], vm_config)
-            vm.deploy_from_template(create_template=False, admin_ip=admin_ip)
+            vms.append(vm)
+
+    wait(vm.async_clone_vm() for vm in vms)
+
+    for vm in vms:
+        vm.vm_obj = vm.get_vm(isTemplate=False)
+        CloudInit.create_iso(vm.role_config, admin_ip)
+        CloudInit.push_iso(vm.vsphere, vm.role_config)
+        vm.power_on()
 
     if conf["parameters"]["media_type"] is not "iso":
         generate_state_file(vsphere, conf)
@@ -1047,14 +1097,61 @@ def deploy(vsphere, conf):
 def destroy(vsphere, conf):
     """ Destroy VM and VM Templates """
 
+    vms = []
     for r in ["admin", "master", "worker"]:
-        Log.task("destroy {0} nodes".format(r))
+        log.task("destroy {0} nodes".format(r))
+        for vm_config in conf[r]["vmguests"]:
+            vm = VMachine(vsphere, conf["parameters"],
+                          conf[r]["config"], vm_config)
+            vmh = vm.get_vm()
+            if vmh:
+                vms.append(vmh)
+
+    log.info("power off all running VMs")
+    wait(h.PowerOffVM_Task() for h in vms
+         if h.runtime.powerState == "poweredOn")
+    log.info("destroy VMs")
+    wait(h.Destroy_Task() for h in vms)
+
+    log.task("delete virtual machines role templates")
+    vms = []
+    for r in ["admin", "master", "worker"]:
+        for vm_config in conf[r]["vmguests"]:
+            vm = VMachine(vsphere, conf["parameters"],
+                          conf[r]["config"], vm_config)
+            h = vm.get_vm(isTemplate=True)
+            if h:
+                vms.append(h)
+                break
+
+    log.info("unregister")
+    try:
+        # AttributeError: 'NoneType' object has no attribute '_stub'
+        # or pyVmomi.VmomiSupport.ManagedObjectNotFound
+        wait(h.UnregisterVM() for h in vms)
+    except Exception:
+        time.sleep(5)
+        try:
+            wait(h.UnregisterVM() for h in vms)
+        except Exception:
+            print("_stub error")
+
+    # Clean up the deployment on the cluster
+    clean_up(vsphere=vsphere, location="remote",
+             path=conf["parameters"]["vm_deploy_dir"])
+
+
+def destroy_old(vsphere, conf):
+    """ Destroy VM and VM Templates """
+
+    for r in ["admin", "master", "worker"]:
+        log.task("destroy {0} nodes".format(r))
         for vm_config in conf[r]["vmguests"]:
             vm = VMachine(vsphere, conf["parameters"],
                           conf[r]["config"], vm_config)
             vm.destroy()
 
-    Log.task("delete virtual machines role templates")
+    log.task("delete virtual machines role templates")
     for r in ["admin", "master", "worker"]:
         for vm_config in conf[r]["vmguests"]:
             vm = VMachine(vsphere, conf["parameters"],
@@ -1069,7 +1166,7 @@ def destroy(vsphere, conf):
 def get_vm_ip(vm_obj, timeout, sleep):
     vm_ip = None
     count = timeout
-    Log.info("waiting IP address for virtual machine: {0}".format(vm_obj.name))
+    log.info("waiting IP address for virtual machine: {0}".format(vm_obj.name))
     while vm_ip is None and count > 0:
         vm_ip = vm_obj.get_ip()
         count -= sleep
@@ -1077,7 +1174,7 @@ def get_vm_ip(vm_obj, timeout, sleep):
         if vm_ip:
             return vm_ip
     if vm_ip is None:
-        Log.error("no IP address found in {0} seconds".format(timeout))
+        quit("no IP address found in {0} seconds".format(timeout))
 
 
 def generate_state_file(vsphere, conf):
@@ -1085,7 +1182,7 @@ def generate_state_file(vsphere, conf):
     Generate deployment state file
     Print it to output and write it to local files
     """
-    Log.task("generate state file")
+    log.task("generate state file")
 
     state = {}
     state["config"] = conf["parameters"]
@@ -1125,44 +1222,44 @@ def generate_state_file(vsphere, conf):
             state["vmguests"][index]["index"] = index
 
     state_file_json = json.dumps(state, indent=2)
-    print("====BEGINING_STATE====")
+    print("====BEGINNING_STATE====")
     print(state_file_json)
     print("====END_STATE====")
 
     try:
-        Log.info("writing state file to: {0}".format(state_filename))
+        log.info("writing state file to: {0}".format(state_filename))
         with open(state_filename, "w", encoding="utf-8") as f:
             f.write(state_file_json)
 
-        Log.info("copying state file to: {0}".format(state_filename_stack))
+        log.info("copying state file to: {0}".format(state_filename_stack))
         shutil.copyfile(state_filename, state_filename_stack)
     except IOError as e:
-        Log.error("I/O error: {0}".format(e))
+        quit("I/O error: {0}".format(e))
 
-    Log.info("state files successfully created")
+    log.info("state files successfully created")
 
 
 def list_images(vsphere, remote_path):
     """ List images (ISO|VMDK) in a datastore directory """
-    Log.task("list images in directory: [{0}]{1}".format(
+    log.task("list images in directory: [{0}]{1}".format(
         vsphere.datastore.name, remote_path))
 
     if Datastore.path_exists(vsphere, remote_path):
         iso = Datastore.list_path(
             vsphere, remote_path, match_pattern=["*.iso"])
         if iso:
-            Log.info("available iso:")
+            log.info("available iso:")
             for i in iso:
-                Log.info(" - {0}".format(i))
+                log.info(" - {0}".format(i))
 
         vmdk = Datastore.list_path(
             vsphere, remote_path, match_pattern=["*.vmdk"])
         if vmdk:
-            Log.info("available vmdk:")
+            log.info("available vmdk:")
             for i in vmdk:
-                Log.info(" - {0}".format(i))
+                log.info(" - {0}".format(i))
     else:
-        Log.error("images directory not found")
+        quit("images directory not found")
 
 
 def push_image(vsphere, src, remote_path):
@@ -1171,20 +1268,20 @@ def push_image(vsphere, src, remote_path):
     The source can be a local path of an HTTP URL
     """
     file_name = os.path.basename(src)
-    Log.task("push image to the datastore")
+    log.task("push image to the datastore")
     Datastore.upload_file(
         vsphere, src, "{0}{1}".format(remote_path, file_name))
 
 
 def delete_image(vsphere, remote_path):
     """ Delete an image from the datastore """
-    Log.task("delete image from the datastore")
+    log.task("delete image from the datastore")
     Datastore.delete_path(vsphere, remote_path)
 
 
 def status(vsphere, conf):
     """ Retrieve info about VMs and Templates """
-    Log.task("show virtual machines and templates")
+    log.task("show virtual machines and templates")
     datacenter = vsphere.get_datacenter()
 
     vm_status = PrettyTable()
@@ -1195,9 +1292,13 @@ def status(vsphere, conf):
                              "VMware Tools",
                              "Template"]
 
-    regex = re.compile("({0})|({1})|({2})".format(conf["parameters"]["admin_node"],
-                                                  conf["parameters"]["master_node"],
-                                                  conf["parameters"]["worker_node"],))
+    regex = re.compile("({0})|({1})|({2})".format(
+        conf["parameters"]["admin_node"],
+        conf["parameters"]["master_node"],
+        conf["parameters"]["worker_node"]
+    ))
+    if "show_regex" in conf["parameters"]:
+        regex = re.compile(conf["parameters"]["show_regex"])
 
     show_all = conf["parameters"].get("show_all", None)
     vms = []
@@ -1205,11 +1306,12 @@ def status(vsphere, conf):
     for vm in datacenter.vmFolder.childEntity:
         try:
             if re.search(regex, vm.name):
-                vms.append(vm)
+                if vm.guest:  # make sure it is a vm
+                    vms.append(vm)
             if show_all:
                 if vm.guest:  # make sure it is a vm
                     vms.append(vm)
-        # avoid failing as there is no attribute to differenciate
+        # avoid failing as there is no attribute to differentiate
         # betwwen a Folder, vApp and a VirtualMachine
         except AttributeError:
             pass
@@ -1233,6 +1335,7 @@ def main():
     media_dir = conf["parameters"]["media_dir"]
 
     vsphere = VSphere(conf["parameters"])
+    wait._service_instance = vsphere.service_instance
 
     if action == "deploy":
         deploy(vsphere, conf)
